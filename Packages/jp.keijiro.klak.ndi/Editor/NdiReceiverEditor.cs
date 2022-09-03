@@ -63,7 +63,7 @@ sealed class NdiReceiverEditor : UnityEditor.Editor
         _targetTexture = finder["_targetTexture"];
         _targetRenderer = finder["_targetRenderer"];
         _targetMaterialProperty = finder["_targetMaterialProperty"];
-        _audioSource = finder["audioSource"];
+        _audioSource = finder["_audioSource"];
     }
 
     public override void OnInspectorGUI()
@@ -87,7 +87,6 @@ sealed class NdiReceiverEditor : UnityEditor.Editor
         // Target texture/renderer
         EditorGUILayout.PropertyField(_targetTexture);
         EditorGUILayout.PropertyField(_targetRenderer);
-        EditorGUILayout.PropertyField(_audioSource);
 
         EditorGUI.indentLevel++;
 
@@ -106,9 +105,16 @@ sealed class NdiReceiverEditor : UnityEditor.Editor
 
         EditorGUI.indentLevel--;
 
+        EditorGUI.BeginChangeCheck();
+        EditorGUILayout.PropertyField(_audioSource);
+        var audioSourceChanged = EditorGUI.EndChangeCheck();
+
         serializedObject.ApplyModifiedProperties();
 
         if (restart) RequestRestart();
+
+        if (audioSourceChanged)
+            foreach (NdiReceiver receiver in targets) receiver.CheckAudioSource();
     }
 }
 

@@ -38,6 +38,9 @@ public sealed partial class NdiReceiver : MonoBehaviour
 
 		_converter?.Dispose();
 		_converter = null;
+
+		if(m_aTempAudioPullBuffer.IsCreated)
+			m_aTempAudioPullBuffer.Dispose();
 	}
 
 	#endregion
@@ -53,7 +56,6 @@ public sealed partial class NdiReceiver : MonoBehaviour
 	private CancellationTokenSource tokenSource;
 	private CancellationToken cancellationToken;
 	private static SynchronizationContext mainThreadContext;
-	private AudioClip audioClip;
 
 	void Awake()
 	{
@@ -65,11 +67,19 @@ public sealed partial class NdiReceiver : MonoBehaviour
 		cancellationToken = tokenSource.Token;
 
 		Task.Run(ReceiveFrameTask, cancellationToken);
+
+		UpdateAudioExpectations();
+		AudioSettings.OnAudioConfigurationChanged += AudioSettings_OnAudioConfigurationChanged;
+		CheckAudioSource();
 	}
 
 	void OnDestroy()
 	{
 		tokenSource?.Cancel();
+		ReleaseInternalObjects();
+
+		AudioSettings.OnAudioConfigurationChanged -= AudioSettings_OnAudioConfigurationChanged;
+		DestroyAudioSourceBridge();
 	}
 
 	#endregion
@@ -80,8 +90,6 @@ public sealed partial class NdiReceiver : MonoBehaviour
 	{
 		try
 		{
-			Debug.Log("Starting Task");
-
 			// retrieve frames in a loop
 			while (!cancellationToken.IsCancellationRequested)
 			{
@@ -126,20 +134,10 @@ public sealed partial class NdiReceiver : MonoBehaviour
 						break;
 				}
 			}
-
-			if (cancellationToken.IsCancellationRequested)
-			{
-				Debug.Log("ReceiveFrameTask cancel requested.");
-			}
 		}
 		catch (System.Exception e)
 		{
 			Debug.LogException(e);
-		}
-		finally
-		{
-			ReleaseInternalObjects();
-			Debug.Log("Good night.");
 		}
 	}
 
@@ -180,14 +178,6 @@ public sealed partial class NdiReceiver : MonoBehaviour
 		Interop.AudioFrame audioFrame = (Interop.AudioFrame)data;
 
 		if (_recv == null) return;
-
-		if (audioSource == null || !audioSource.enabled || !audioFrame.HasData)
-		{
-			_recv.FreeAudioFrame(audioFrame);
-			return;
-		}
-
-		PrepareAudioSource(audioFrame);
 
 		_recv.FreeAudioFrame(audioFrame);
 	}
@@ -230,31 +220,108 @@ public sealed partial class NdiReceiver : MonoBehaviour
 	private Interop.AudioFrameInterleaved	interleavedAudio = new Interop.AudioFrameInterleaved();
 	//
 	private float[]							m_aTempSamplesArray = new float[ 1024 * 32 ];
+	
+	private int _expectedAudioSampleRate;
+	private int _expectedAudioChannels;
 
-	void PrepareAudioSource(Interop.AudioFrame audioFrame)
+	private int _receivedAudioSampleRate;
+	private int _receivedAudioChannels;
+
+	private bool _hasAudioSource;
+	private AudioSourceBridge _audioSourceBridge;
+
+	internal void CheckAudioSource()
 	{
-		if (audioSource.isPlaying)
-		{
+		if(Application.isPlaying == false)
 			return;
-		}
 
-		// if the audio format changed, we need to create a new audio clip
-		if (audioClip == null ||
-			audioClip.channels != audioFrame.NoChannels ||
-			audioClip.frequency != audioFrame.SampleRate)
-		{
-			Debug.Log($"PrepareAudioSource: Creating audio clip to match frame data: {audioFrame}");
+		_hasAudioSource = _audioSource != null;
 
-			// Create a AudioClip that matches the incomming frame
-			audioClip = AudioClip.Create("NdiReceiver Audio", audioFrame.SampleRate, audioFrame.NoChannels, audioFrame.SampleRate, true);
-		}
+		DestroyAudioSourceBridge();
 
-		audioSource.loop = true;
-		audioSource.clip = audioClip;
-		audioSource.Play();
+		if (_hasAudioSource == false)
+			return;
+
+		// Make sure it is playing so OnAudioFilterRead gets called by Unity
+		_audioSource.Play();
+
+		if (_audioSource.gameObject == gameObject)
+			return;
+
+		// Create a bridge component if the AudioSource is not on this GameObject so we can feed audio samples to it.
+		_audioSourceBridge = _audioSource.GetComponent<AudioSourceBridge>();
+		if(_audioSourceBridge == null)
+			_audioSourceBridge = _audioSource.gameObject.AddComponent<AudioSourceBridge>();
+
+		_audioSourceBridge._handler = this;
 	}
 
+	private void DestroyAudioSourceBridge()
+	{
+		if (_audioSourceBridge == null)
+			return;
+
+		_audioSourceBridge._handler = null;
+
+		if(_audioSourceBridge._isDestroyed == false)
+			GameObject.DestroyImmediate(_audioSourceBridge);
+
+		_audioSourceBridge = null;
+	}
+
+	private void AudioSettings_OnAudioConfigurationChanged(bool deviceWasChanged)
+	{
+		UpdateAudioExpectations();
+	}
+
+	private void UpdateAudioExpectations()
+	{
+		_expectedAudioSampleRate = AudioSettings.outputSampleRate;
+		switch (AudioSettings.speakerMode)
+		{
+			case AudioSpeakerMode.Mono:
+			case AudioSpeakerMode.Stereo:
+				_expectedAudioChannels = (int)AudioSettings.speakerMode;
+				break;
+
+			case AudioSpeakerMode.Quad:
+				_expectedAudioChannels = 4;
+				break;
+
+			case AudioSpeakerMode.Surround:
+				_expectedAudioChannels = 5;
+				break;
+
+			case AudioSpeakerMode.Mode5point1:
+				_expectedAudioChannels = 6;
+				break;
+
+			case AudioSpeakerMode.Mode7point1:
+				_expectedAudioChannels = 8;
+				break;
+		}
+	}
+
+	// Automagically called by Unity when an AudioSource component is present on the same GameObject
 	void OnAudioFilterRead(float[] data, int channels)
+	{
+		if ((object)_audioSource == null)
+			return;
+
+		if ((object)_audioSourceBridge != null)
+			return;
+
+		HandleAudioFilterRead(data, channels);
+	}
+
+	internal void HandleAudioSourceBridgeOnDestroy()
+	{
+		_audioSource = null;
+
+		DestroyAudioSourceBridge();
+	}
+
+	internal void HandleAudioFilterRead(float[] data, int channels)
 	{
 		int length = data.Length;
 
@@ -284,79 +351,180 @@ public sealed partial class NdiReceiver : MonoBehaviour
 			m_bWaitForBufferFill = (iAudioBufferSize < length);
 			if( !m_bWaitForBufferFill )
 			{
-				audioBuffer.Front( ref data, data.Length );
-				audioBuffer.PopFront( data.Length );
+				audioBuffer.Front( ref data, length );
+				audioBuffer.PopFront( length );
 			}
 		}
 
 		if ( m_bWaitForBufferFill && !bPreviousWaitForBufferFill )
 		{
-			Debug.Log("NOT ENOUGH AUDIO : OnAudioFilterRead: data.Length = " + data.Length + "| audioBuffer.Size = " + iAudioBufferSize);
+			Debug.LogWarning($"Audio buffer underrun: OnAudioFilterRead: data.Length = {data.Length} | audioBuffer.Size = {iAudioBufferSize}", this);
 		}
 	}
 
 	void FillAudioBuffer(Interop.AudioFrame audio)
 	{
-		if (_recv == null)
+		if (_recv == null || _hasAudioSource == false)
 		{
 			return;
 		}
 
-		// Converted from NDI C# Managed sample code
-		// we're working in bytes, so take the size of a 32 bit sample (float) into account
-		int sizeInBytes = audio.NoSamples * audio.NoChannels * sizeof(float);
-
-		// Unity is expecting interleaved audio and NDI uses planar.
-		// create an interleaved frame and convert from the one we received
-		interleavedAudio.SampleRate = audio.SampleRate;
-		interleavedAudio.NoChannels = audio.NoChannels;
-		interleavedAudio.NoSamples = audio.NoSamples;
-		interleavedAudio.Timecode = audio.Timecode;
-
-		// allocate native array to copy interleaved data into
-		unsafe
+		if (audio.SampleRate != _receivedAudioSampleRate)
 		{
-			if( m_aTempAudioPullBuffer == null || m_aTempAudioPullBuffer.Length < sizeInBytes)
+			_receivedAudioSampleRate = audio.SampleRate;
+			if (_receivedAudioSampleRate != _expectedAudioSampleRate)
+				Debug.LogWarning($"Audio sample rate does not match. Expected {_expectedAudioSampleRate} but received {_receivedAudioSampleRate}.", this);
+		}
+
+		if(audio.NoChannels != _receivedAudioChannels)
+		{
+			_receivedAudioChannels = audio.NoChannels;
+			if(_receivedAudioChannels != _expectedAudioChannels)
+				Debug.LogWarning($"Audio channel count does not match. Expected {_expectedAudioChannels} but received {_receivedAudioChannels}.", this);
+		}
+
+		if (audio.Metadata != null)
+			Debug.Log(audio.Metadata);
+
+		int totalSamples = 0;
+
+		// If the received data's format is as expected we can convert from interleaved to planar and just memcpy
+		if (_receivedAudioSampleRate == _expectedAudioSampleRate && _receivedAudioChannels == _expectedAudioChannels)
+		{
+			// Converted from NDI C# Managed sample code
+			// we're working in bytes, so take the size of a 32 bit sample (float) into account
+			int sizeInBytes = audio.NoSamples * audio.NoChannels * sizeof(float);
+
+			// Unity is expecting interleaved audio and NDI uses planar.
+			// create an interleaved frame and convert from the one we received
+			interleavedAudio.SampleRate = audio.SampleRate;
+			interleavedAudio.NoChannels = audio.NoChannels;
+			interleavedAudio.NoSamples = audio.NoSamples;
+			interleavedAudio.Timecode = audio.Timecode;
+
+			// allocate native array to copy interleaved data into
+			unsafe
 			{
-				m_aTempAudioPullBuffer = new NativeArray<byte>(sizeInBytes, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
-			}
-
-			interleavedAudio.Data = (IntPtr)m_aTempAudioPullBuffer.GetUnsafePtr();
-			if ( interleavedAudio.Data != null )
-			{
-				// Convert from float planar to float interleaved audio
-				_recv.AudioFrameToInterleaved(ref audio, ref interleavedAudio);
-
-				var totalSamples = interleavedAudio.NoSamples * interleavedAudio.NoChannels;
-				void* audioDataPtr = interleavedAudio.Data.ToPointer();
-
-				if( audioDataPtr != null )
+				if (m_aTempAudioPullBuffer.Length < sizeInBytes)
 				{
-					// Grab data from native array
-					if( m_aTempSamplesArray == null || m_aTempSamplesArray.Length < totalSamples )
-					{
-						m_aTempSamplesArray = new float[ totalSamples ];
-					}
-					if( m_aTempSamplesArray != null )
-					{
-						for (int i = 0; i < totalSamples; i++)
-						{
-							m_aTempSamplesArray[ i ] = UnsafeUtility.ReadArrayElement<float>( audioDataPtr, i );
-						}
-					}
+					if (m_aTempAudioPullBuffer.IsCreated)
+						m_aTempAudioPullBuffer.Dispose();
 
-					// Copy new sample data into the circular array
-					lock (audioBufferLock)
+					m_aTempAudioPullBuffer = new NativeArray<byte>(sizeInBytes, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+				}
+
+				interleavedAudio.Data = (IntPtr)m_aTempAudioPullBuffer.GetUnsafePtr();
+				if (interleavedAudio.Data != null)
+				{
+					// Convert from float planar to float interleaved audio
+					_recv.AudioFrameToInterleaved(ref audio, ref interleavedAudio);
+
+					totalSamples = interleavedAudio.NoSamples * _expectedAudioChannels;
+					void* audioDataPtr = interleavedAudio.Data.ToPointer();
+
+					if (audioDataPtr != null)
 					{
-						audioBuffer.PushBack( m_aTempSamplesArray, totalSamples );
+						if (m_aTempSamplesArray.Length < totalSamples)
+						{
+							m_aTempSamplesArray = new float[totalSamples];
+						}
+
+						// Grab data from native array
+						var tempSamplesPtr = UnsafeUtility.PinGCArrayAndGetDataAddress(m_aTempSamplesArray, out ulong tempSamplesHandle);
+						UnsafeUtility.MemCpy(tempSamplesPtr, audioDataPtr, totalSamples * sizeof(float));
+						UnsafeUtility.ReleaseGCObject(tempSamplesHandle);
 					}
 				}
 			}
 		}
+		// If we need to resample or remap channels we can just work with the interleaved data as is
+		else
+		{
+			unsafe
+			{
+				void* audioDataPtr = audio.Data.ToPointer();
+
+				var resamplingRate = (float)_receivedAudioSampleRate / _expectedAudioSampleRate;
+				var needsToResample = resamplingRate != 1;
+				var neededSamples = needsToResample ? (int)(audio.NoSamples / resamplingRate) : audio.NoSamples;
+
+				totalSamples = neededSamples * _expectedAudioChannels;
+
+				// Blindly mix channels if their count does not match. Needs better remapping. Make this behaviour opt-in?
+				if (_receivedAudioChannels != _expectedAudioChannels)
+				{
+					for (int i = 0; i < neededSamples; i++)
+					{
+						var sample = 0f;
+						for (int j = 0; j < audio.NoChannels; j++)
+							sample += ReadAudioDataSampleInterleaved(audio, audioDataPtr, i, j, resamplingRate);
+
+						for (int j = 0; j < _expectedAudioChannels; j++)
+							m_aTempSamplesArray[i * _expectedAudioChannels + j] = sample;
+					}
+				}
+				// So we just need to resample
+				else
+				{
+					for (int i = 0; i < neededSamples; i++)
+					{
+						for (int j = 0; j < _expectedAudioChannels; j++)
+							m_aTempSamplesArray[i * _expectedAudioChannels + j] = ReadAudioDataSampleInterleaved(audio, audioDataPtr, i, j, resamplingRate);
+					}
+				}
+			}
+		}
+
+		// Copy new sample data into the circular array
+		lock (audioBufferLock)
+		{
+			if (audioBuffer.Capacity < totalSamples)
+			{
+				audioBuffer = new CircularBuffer<float>(totalSamples);
+			}
+
+			audioBuffer.PushBack(m_aTempSamplesArray, totalSamples);
+		}
 	}
+
+	private unsafe float ReadAudioDataSampleInterleaved(Interop.AudioFrame audio, void* audioDataPtr, int sampleIndex, int channelIndex, float resamplingRate)
+	{
+		if (resamplingRate == 1)
+			return UnsafeUtility.ReadArrayElement<float>(audioDataPtr, sampleIndex + channelIndex * audio.NoSamples);
+
+		var resamplingIndex = (int)(sampleIndex * resamplingRate);
+		var t = (sampleIndex * resamplingRate) - resamplingIndex;
+
+		var lowerSample = UnsafeUtility.ReadArrayElement<float>(audioDataPtr, resamplingIndex + channelIndex * audio.NoSamples);
+
+		if (Mathf.Approximately(t, 0))
+			return lowerSample;
+
+		var upperSample = UnsafeUtility.ReadArrayElement<float>(audioDataPtr, (resamplingIndex + 1) + channelIndex * audio.NoSamples);
+
+		return Mathf.Lerp(lowerSample, upperSample, t);
+	}
+
+	//private unsafe float ReadAudioDataSamplePlanar(void* audioDataPtr, int sampleIndex, int channelIndex, float resamplingRate)
+	//{
+	//	if (resamplingRate == 1)
+	//		return UnsafeUtility.ReadArrayElement<float>(audioDataPtr, sampleIndex * interleavedAudio.NoChannels + channelIndex);
+
+	//	var resamplingIndex = (int)(sampleIndex * resamplingRate);
+	//	var t = (sampleIndex * resamplingRate) - resamplingIndex;
+
+	//	var lowerSample = UnsafeUtility.ReadArrayElement<float>(audioDataPtr, resamplingIndex * interleavedAudio.NoChannels + channelIndex);
+
+	//	if (Mathf.Approximately(t, 0))
+	//		return lowerSample;
+
+	//	var upperSample = UnsafeUtility.ReadArrayElement<float>(audioDataPtr, (resamplingIndex + 1) * interleavedAudio.NoChannels + channelIndex);
+
+	//	return Mathf.Lerp(lowerSample, upperSample, t);
+	//}
 
 	#endregion
 
-	}
+}
 
 }
