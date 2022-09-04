@@ -1,3 +1,6 @@
+Build
+Build-*
+
 # Windows
 Thumbs.db
 Desktop.ini
@@ -6,6 +9,7 @@ Desktop.ini
 .DS_Store
 
 # Code Editors
+*.idea
 /.idea
 /.vscode
 /*.csproj

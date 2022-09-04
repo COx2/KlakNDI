@@ -18,13 +18,15 @@ public sealed partial class NdiReceiver : MonoBehaviour
 	FormatConverter _converter;
 	MaterialPropertyBlock _override;
 
-
+#if UNITY_EDITOR
 	[ContextMenu("Reload Settings")]
 
 	public void ReloadSettings()
 	{
 		SharedInstance.OnDomainReload();
 	}
+#endif
+	
 	void PrepareInternalObjects()
 	{
 		if (_recv == null) _recv = RecvHelper.TryCreateRecv(_ndiName);
